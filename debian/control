@@ -10,7 +10,7 @@ Build-Depends:
  autoconf (>= 2.59),
  automake,
  check,
- debhelper (>= 10),
+ debhelper (>= 10~),
  dh-python,
  libcppunit-dev,
  libtool,
