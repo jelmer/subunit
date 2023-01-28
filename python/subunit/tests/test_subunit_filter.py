@@ -28,7 +28,7 @@ from testtools import TestCase
 from testtools.testresult.doubles import ExtendedTestResult, StreamResult
 
 import subunit
-from subunit import iso8601
+import iso8601
 from subunit.test_results import make_tag_filter, TestResultFilter
 from subunit import ByteStreamToStreamResult, StreamResultToBytes
 

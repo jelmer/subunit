@@ -124,6 +124,8 @@ import subprocess
 import sys
 import unittest
 
+import iso8601
+
 from testtools import content, content_type, ExtendedToOriginalDecorator
 from testtools.content import TracebackContent
 from testtools.compat import _b, _u
@@ -135,7 +137,7 @@ except ImportError:
         "_StringException, check your version.")
 from testtools import testresult, CopyStreamResult
 
-from subunit import chunked, details, iso8601, test_results
+from subunit import chunked, details, test_results
 from subunit.v2 import ByteStreamToStreamResult, StreamResultToBytes
 
 # same format as sys.version_info: "A tuple containing the five components of
@@ -551,7 +553,7 @@ class TestProtocolServer(object):
     def _handleTime(self, offset, line):
         # Accept it, but do not do anything with it yet.
         try:
-            event_time = iso8601.parse_date(line[offset:-1])
+            event_time = iso8601.parse_date(line[offset:-1].decode())
         except TypeError:
             raise TypeError(_u("Failed to parse %r, got %r")
                 % (line, sys.exec_info[1]))
@@ -794,7 +796,7 @@ class TestProtocolClient(testresult.TestResult):
 
         ":param datetime: A datetime.datetime object.
         """
-        time = a_datetime.astimezone(iso8601.Utc())
+        time = a_datetime.astimezone(iso8601.UTC)
         self._stream.write(_b("time: %04d-%02d-%02d %02d:%02d:%02d.%06dZ\n" % (
             time.year, time.month, time.day, time.hour, time.minute,
             time.second, time.microsecond)))

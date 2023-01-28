@@ -23,7 +23,7 @@ from optparse import (
 import sys
 
 from subunit import make_stream_binary
-from subunit.iso8601 import UTC
+from iso8601 import UTC
 from subunit.v2 import StreamResultToBytes
 
 

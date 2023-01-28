@@ -34,7 +34,7 @@ from testtools.matchers import (
 )
 from testtools.testresult.doubles import StreamResult
 
-from subunit.iso8601 import UTC
+from iso8601 import UTC
 from subunit.v2 import StreamResultToBytes, ByteStreamToStreamResult
 from subunit._output import (
     _ALL_ACTIONS,
