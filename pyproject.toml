@@ -68,6 +68,7 @@ where = ["python"]
 "subunit2pyunit" = "subunit.filter_scripts.subunit2pyunit:main"
 "gojson2subunit" = "subunit.filter_scripts.gojson2subunit:main"
 "junitxml2subunit" = "subunit.filter_scripts.junitxml2subunit:main"
+"jvmtest-subunit" = "subunit.filter_scripts.jvmtest_subunit:main"
 "tap2subunit" = "subunit.filter_scripts.tap2subunit:main"
 
 [tool.setuptools.dynamic]
