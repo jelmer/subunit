@@ -21,28 +21,36 @@ Surefire, Gradle, Ant) and many other ecosystems. Maven and Gradle write
 one XML file per test class into a reports directory, so this script
 accepts directories as well as individual files.
 
-Typical use with Maven::
+Two operating modes:
 
-    mvn clean test ; junitxml2subunit -d target/surefire-reports
+* **Batch** (default): convert each input file once and exit.
+* **Watch** (``--watch DIR``): poll the reports directory and stream
+  packets as each per-class XML file finishes being written. Combined
+  with ``--until-pid PID``, the script exits when the build process
+  does — perfect for live progress under inquest::
 
-Typical use with Gradle::
+      mvn test -q & junitxml2subunit --watch target/surefire-reports \\
+          --until-pid $!
 
-    gradle clean test ; junitxml2subunit -d build/test-results/test
+  Both Maven Surefire and Gradle write the per-class report to disk
+  the moment that class finishes, so polling is enough to give live
+  feedback without any cooperation from the build tool.
 """
 
 import argparse
 import os
 import sys
 
-from subunit import JUnitXML2SubUnit
+from subunit import JUnitXML2SubUnit, watch_junit_xml
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         description=(
             "Convert JUnit XML test reports to a subunit v2 stream on stdout. "
-            "Pass individual files as positional arguments or use -d/--dir to "
-            "walk a reports directory for *.xml files."
+            "Pass individual files as positional arguments, use -d/--dir to "
+            "walk a reports directory for *.xml files, or use --watch DIR "
+            "to stream results live as the test runner writes them."
         ),
     )
     parser.add_argument(
@@ -56,6 +64,40 @@ def parse_args(argv):
             "Directory to walk for *.xml report files. May be repeated. "
             "Files inside the directory are converted in lexical order so "
             "the output is deterministic across runs."
+        ),
+    )
+    parser.add_argument(
+        "--watch",
+        dest="watch",
+        metavar="DIR",
+        help=(
+            "Watch DIR for newly-written *.xml report files and stream "
+            "packets live. Combine with --until-pid to stop when the "
+            "test runner exits. Mutually exclusive with -d/--dir and "
+            "positional FILE args."
+        ),
+    )
+    parser.add_argument(
+        "--until-pid",
+        dest="until_pid",
+        type=int,
+        metavar="PID",
+        help=(
+            "With --watch, exit when this process is no longer alive. "
+            "Typically the PID of the backgrounded build tool: "
+            "`mvn test & junitxml2subunit --watch DIR --until-pid $!`."
+        ),
+    )
+    parser.add_argument(
+        "--poll-secs",
+        dest="poll_secs",
+        type=float,
+        default=1.0,
+        metavar="SECS",
+        help=(
+            "With --watch, seconds between directory rescans. Defaults "
+            "to 1.0; smaller values just waste CPU since Surefire and "
+            "Gradle write reports at much coarser granularity."
         ),
     )
     parser.add_argument(
@@ -89,9 +131,24 @@ def collect_files(dirs, files):
 
 def main(argv=None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
+
+    if args.watch:
+        if args.dirs or args.files:
+            sys.stderr.write(
+                "junitxml2subunit: --watch is mutually exclusive with "
+                "-d/--dir and positional FILE arguments\n"
+            )
+            return 2
+        return watch_junit_xml(
+            args.watch,
+            sys.stdout.buffer,
+            until_pid=args.until_pid,
+            poll_secs=args.poll_secs,
+        )
+
     inputs = collect_files(args.dirs, args.files)
     if not inputs:
-        sys.stderr.write("junitxml2subunit: no input files found (pass FILE arguments or use -d DIR)\n")
+        sys.stderr.write("junitxml2subunit: no input files found (pass FILE arguments, use -d DIR, or use --watch DIR)\n")
         return 2
     return JUnitXML2SubUnit(inputs, sys.stdout.buffer)
 

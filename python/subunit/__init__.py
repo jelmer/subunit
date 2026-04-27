@@ -1302,16 +1302,57 @@ def JUnitXML2SubUnit(xml_files, output_stream):
         the broken XML doesn't get silently swallowed.
     """
     import datetime
-    import xml.etree.ElementTree as ET
 
     output = StreamResultToBytes(output_stream)
-    UTF8_TEXT = "text/plain; charset=UTF8"
+    # Synthetic timestamps shared across the whole batch. Wrapping the
+    # state in a list so the per-file helper can mutate it; callers in
+    # batch mode never see this — it's an implementation detail of how
+    # we keep durations meaningful when concatenating multiple suites.
+    clock_state = [datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)]
     any_failed = False
-    # Synthetic timestamps. We don't know when the JUnit run actually
-    # happened, but spacing the inprogress/terminal packets by each
-    # testcase's recorded `time` attribute lets consumers compute the
-    # right duration without making up wall-clock data.
-    clock = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
+    for path in xml_files:
+        any_failed_here, parse_error = _process_junit_xml(
+            path, output, clock_state, warn_on_parse_error=True
+        )
+        if parse_error or any_failed_here:
+            any_failed = True
+    return 1 if any_failed else 0
+
+
+def _process_junit_xml(path, output, clock_state, warn_on_parse_error):
+    """Convert one JUnit XML file into subunit packets.
+
+    Shared between ``JUnitXML2SubUnit`` (batch) and the watch loop
+    (incremental). The clock advances per-testcase by the testcase's
+    recorded ``time`` so the consumer recovers durations even when
+    multiple files are concatenated.
+
+    :param path: File path to read.
+    :param output: A ``StreamResultToBytes`` to emit packets through.
+    :param clock_state: A single-element list holding the current
+        ``datetime``. Mutated in place so successive calls keep
+        advancing the same clock.
+    :param warn_on_parse_error: When ``True`` (batch mode), a
+        ``ParseError`` writes a stderr line. The watch mode passes
+        ``False`` because partial files are an expected mid-write
+        state, not a real error.
+    :return: ``(any_failed, parse_error)`` — ``any_failed`` is ``True``
+        if any testcase had a fail/error status; ``parse_error`` is
+        ``True`` if the file was unreadable or malformed XML, in which
+        case nothing was emitted.
+    """
+    import datetime
+    import xml.etree.ElementTree as ET
+
+    UTF8_TEXT = "text/plain; charset=UTF8"
+    try:
+        tree = ET.parse(path)
+    except (OSError, ET.ParseError) as exc:
+        if warn_on_parse_error:
+            sys.stderr.write(
+                "JUnitXML2SubUnit: failed to parse {}: {}\n".format(path, exc)
+            )
+        return False, True
 
     def parse_time(value):
         if value is None:
@@ -1331,60 +1372,160 @@ def JUnitXML2SubUnit(xml_files, output_stream):
                 yield ts
         # Anything else is silently ignored — a non-JUnit document.
 
-    for path in xml_files:
+    any_failed = False
+    root = tree.getroot()
+    for suite in iter_testsuites(root):
+        for case in suite.findall("testcase"):
+            classname = case.get("classname") or ""
+            name = case.get("name") or ""
+            if not name:
+                # Without a name there's no usable test_id; skip
+                # rather than emit a malformed ID.
+                continue
+            test_id = "{}::{}".format(classname, name) if classname else name
+            duration = parse_time(case.get("time"))
+
+            failure = case.find("failure")
+            error = case.find("error")
+            skipped = case.find("skipped")
+
+            if failure is not None or error is not None:
+                status = "fail"
+                detail = failure if failure is not None else error
+                file_bytes = _format_junit_detail(detail)
+                any_failed = True
+            elif skipped is not None:
+                status = "skip"
+                file_bytes = _format_junit_detail(skipped)
+            else:
+                status = "success"
+                file_bytes = None
+
+            start_ts = clock_state[0]
+            end_ts = start_ts + datetime.timedelta(seconds=duration)
+            clock_state[0] = end_ts
+
+            output.status(
+                test_id=test_id,
+                test_status="inprogress",
+                timestamp=start_ts,
+            )
+            output.status(
+                test_id=test_id,
+                test_status=status,
+                eof=True,
+                file_name="junit detail" if file_bytes else None,
+                file_bytes=file_bytes,
+                mime_type=UTF8_TEXT if file_bytes else None,
+                timestamp=end_ts,
+            )
+
+    return any_failed, False
+
+
+def watch_junit_xml(directory, output_stream, until_pid=None, poll_secs=1.0):
+    """Watch a JUnit XML reports directory and stream subunit packets live.
+
+    Used by ``junitxml2subunit --watch``. Both Maven Surefire and Gradle
+    write per-test-class XML files to disk *as each class finishes*, not
+    in a final batch — so polling the directory and converting each new
+    file as it appears is enough to give the consumer real-time progress
+    without any cooperation from the build tool.
+
+    The function loops until ``until_pid`` (the PID of the build tool
+    process) is no longer alive, then does one final sweep to catch any
+    files written between the last poll and the process exit. If
+    ``until_pid`` is ``None`` the loop runs until interrupted.
+
+    A file is processed exactly once. Mid-write reads are detected via
+    ``ET.ParseError`` and the file is left for a later poll, when it
+    will (with overwhelming probability) be complete. We intentionally
+    don't try to be clever about atomic-rename detection because
+    Surefire writes directly to the final filename — there is no rename
+    to wait for.
+
+    :param directory: Path to the JUnit reports directory to watch.
+    :param output_stream: Binary stream for subunit v2 output. Flushed
+        after each processed file so the consumer sees results live.
+    :param until_pid: Optional integer PID. The loop exits once that
+        process is no longer alive (Unix only — uses ``kill -0``).
+    :param poll_secs: Seconds between directory rescans. Defaults to
+        1.0; smaller values just waste CPU since Surefire/Gradle write
+        files at much coarser granularity.
+    :return: 0 if no testcase failed across the whole watch, 1 if any
+        did or any file was unreadable on the final retry.
+    """
+    import datetime
+    import time
+    import xml.etree.ElementTree as ET
+
+    if not os.path.isdir(directory):
+        sys.stderr.write(
+            "junitxml2subunit: not a directory: {}\n".format(directory)
+        )
+        return 2
+
+    output = StreamResultToBytes(output_stream)
+    clock_state = [datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)]
+    seen = set()
+    any_failed = False
+
+    def is_alive(pid):
+        if pid is None:
+            return True
         try:
-            tree = ET.parse(path)
-        except (OSError, ET.ParseError) as exc:
-            sys.stderr.write("JUnitXML2SubUnit: failed to parse {}: {}\n".format(path, exc))
-            any_failed = True
-            continue
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # PID exists but isn't ours; treat as alive — better to
+            # over-poll than to exit early on a misattributed signal.
+            return True
 
-        root = tree.getroot()
-        for suite in iter_testsuites(root):
-            for case in suite.findall("testcase"):
-                classname = case.get("classname") or ""
-                name = case.get("name") or ""
-                if not name:
-                    # Without a name there's no usable test_id; skip
-                    # rather than emit a malformed ID.
-                    continue
-                test_id = "{}::{}".format(classname, name) if classname else name
-                duration = parse_time(case.get("time"))
+    def sweep(final):
+        nonlocal any_failed
+        # Sort for deterministic output across runs and filesystems.
+        for entry in sorted(os.listdir(directory)):
+            if not entry.endswith(".xml"):
+                continue
+            path = os.path.join(directory, entry)
+            if path in seen:
+                continue
+            try:
+                # Tickle the file so a still-truncated write produces a
+                # clean ParseError rather than an emit-then-crash.
+                ET.parse(path)
+            except (OSError, ET.ParseError):
+                if final:
+                    # Last chance — surface as a real parse error.
+                    failed_here, parse_err = _process_junit_xml(
+                        path, output, clock_state, warn_on_parse_error=True
+                    )
+                    seen.add(path)
+                    if failed_here or parse_err:
+                        any_failed = True
+                # Otherwise leave it for the next poll.
+                continue
+            failed_here, parse_err = _process_junit_xml(
+                path, output, clock_state, warn_on_parse_error=final
+            )
+            seen.add(path)
+            if failed_here or parse_err:
+                any_failed = True
+            output_stream.flush()
 
-                failure = case.find("failure")
-                error = case.find("error")
-                skipped = case.find("skipped")
+    try:
+        while is_alive(until_pid):
+            sweep(final=False)
+            time.sleep(poll_secs)
+    except KeyboardInterrupt:
+        pass
 
-                if failure is not None or error is not None:
-                    status = "fail"
-                    detail = failure if failure is not None else error
-                    file_bytes = _format_junit_detail(detail)
-                    any_failed = True
-                elif skipped is not None:
-                    status = "skip"
-                    file_bytes = _format_junit_detail(skipped)
-                else:
-                    status = "success"
-                    file_bytes = None
-
-                start_ts = clock
-                end_ts = clock + datetime.timedelta(seconds=duration)
-                clock = end_ts
-
-                output.status(
-                    test_id=test_id,
-                    test_status="inprogress",
-                    timestamp=start_ts,
-                )
-                output.status(
-                    test_id=test_id,
-                    test_status=status,
-                    eof=True,
-                    file_name="junit detail" if file_bytes else None,
-                    file_bytes=file_bytes,
-                    mime_type=UTF8_TEXT if file_bytes else None,
-                    timestamp=end_ts,
-                )
+    # One final sweep to catch any reports written between the last
+    # poll and the build process exit.
+    sweep(final=True)
+    output_stream.flush()
 
     return 1 if any_failed else 0
 
